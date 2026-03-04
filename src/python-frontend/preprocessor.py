@@ -1948,9 +1948,14 @@ class Preprocessor(ast.NodeTransformer):
                     if (isinstance(node.value, ast.Call) and
                             isinstance(node.value.func, ast.Name)):
                         self.instance_class_map[target.id] = node.value.func.id
-                        # Track generator variables: g = gen() where gen is a generator
+                        # Track generator variables: g = gen() where gen is a generator.
+                        # Replace the call with a non-None sentinel (True) so that
+                        # 'g is not None' holds: generator objects are always non-None.
                         if node.value.func.id in self.generator_funcs:
                             self.generator_vars[target.id] = node.value.func.id
+                            sentinel = ast.Constant(value=True)
+                            ast.copy_location(sentinel, node.value)
+                            node.value = sentinel
                 return node
 
         # Handle multiple assignment: convert ans = i = 0 into separate assignments
