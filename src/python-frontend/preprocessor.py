@@ -24,8 +24,9 @@ class Preprocessor(ast.NodeTransformer):
         self.decimal_class_alias = None
         self.decimal_module_alias = None
         self._subscript_inferred_vars = set()  # vars whose annotations came from subscript inference
-        self.generator_funcs = set()  # generator functions with early return before first yield
+        self.generator_funcs = set()  # generator functions (contain yield)
         self.generator_vars = {}  # var_name → func_name for generator variables
+        self.generator_func_defs = {}  # func_name → transformed body (list of stmts)
 
     def _create_helper_functions(self):
         """Create the ESBMC helper function definitions"""
@@ -271,6 +272,79 @@ class Preprocessor(ast.NodeTransformer):
             if isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Yield, ast.YieldFrom)):
                 return False
         return False
+
+    def _inline_generator_for(self, node):
+        """
+        Inline a generator-based for loop.
+
+        Transforms:
+            for x in g:       # where g = gen_func()
+                body
+
+        Into the generator body with each `yield val` replaced by:
+            x = val
+            body
+
+        Returns the list of inlined statements, or None if inlining is not possible.
+        """
+        import copy
+
+        if not isinstance(node.iter, ast.Name):
+            return None
+        gen_var = node.iter.id
+        func_name = self.generator_vars.get(gen_var)
+        if func_name is None:
+            return None
+        body_stmts = self.generator_func_defs.get(func_name)
+        if body_stmts is None:
+            return None
+
+        # Get the loop target variable name
+        if hasattr(node.target, 'id'):
+            target_name = node.target.id
+        else:
+            return None  # Only handle simple name targets
+
+        for_body = node.body
+
+        class _YieldReplacer(ast.NodeTransformer):
+            """Replace `yield val` expressions with `target = val; for_body`."""
+            def __init__(self, target_name, for_body, template):
+                self.target_name = target_name
+                self.for_body = for_body
+                self.template = template
+
+            def visit_Expr(self, stmt):
+                if not isinstance(stmt.value, ast.Yield):
+                    return stmt
+                yield_val = stmt.value.value
+                if yield_val is None:
+                    yield_val = ast.Constant(value=None)
+                # target = yield_val
+                assign = ast.Assign(
+                    targets=[ast.Name(id=self.target_name, ctx=ast.Store())],
+                    value=yield_val,
+                    type_comment=None
+                )
+                ast.copy_location(assign, self.template)
+                ast.fix_missing_locations(assign)
+                return [assign] + [copy.deepcopy(s) for s in self.for_body]
+
+        inlined = copy.deepcopy(body_stmts)
+        replacer = _YieldReplacer(target_name, for_body, node)
+        result = []
+        for stmt in inlined:
+            out = replacer.visit(stmt)
+            if isinstance(out, list):
+                result.extend(out)
+            elif out is not None:
+                result.append(out)
+
+        for stmt in result:
+            self.ensure_all_locations(stmt, node)
+            ast.fix_missing_locations(stmt)
+
+        return result
 
     def _find_generator_next_call(self, node):
         """Return True if node tree contains next(g) where g is a tracked generator variable."""
@@ -625,6 +699,11 @@ class Preprocessor(ast.NodeTransformer):
             self.is_range_loop = False
             return self._transform_items_for(node)
         else:
+            # Check if iterating over a generator variable → inline the generator body
+            if isinstance(node.iter, ast.Name) and node.iter.id in self.generator_vars:
+                inlined = self._inline_generator_for(node)
+                if inlined is not None:
+                    return inlined
             # Handle general iteration over iterables (strings, lists, etc.)
             self.is_range_loop = False
             return self._transform_iterable_for(node)
@@ -2185,10 +2264,12 @@ class Preprocessor(ast.NodeTransformer):
 
 
     def visit_FunctionDef(self, node):
-        # Detect generator functions: contain yield AND have early return before first yield
-        if any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(node)):
-            if self._has_early_return_before_yield(node.body):
-                self.generator_funcs.add(node.name)
+        # Detect generator functions: any function that contains yield
+        is_generator = any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(node))
+        if is_generator:
+            self.generator_funcs.add(node.name)
+            # For early-return-before-yield: handled by next(g) → raise StopIteration
+            # For normal generators: body is saved after transformation for inlining
 
         # Store return type annotation so call-expression iterables can resolve types
         if node.returns is not None:
@@ -2216,6 +2297,8 @@ class Preprocessor(ast.NodeTransformer):
         # escape early if no defaults defined
         if len(node.args.defaults) < 1 and len(node.args.kw_defaults) < 1:
             self.generic_visit(node)
+            if is_generator:
+                self.generator_func_defs[node.name] = list(node.body)
             return node
         return_nodes = []
 
@@ -2243,6 +2326,8 @@ class Preprocessor(ast.NodeTransformer):
                     return_nodes.append(assignment_node)
 
         self.generic_visit(node)
+        if is_generator:
+            self.generator_func_defs[node.name] = list(node.body)
         return_nodes.append(node)
         return return_nodes
 
