@@ -24,6 +24,8 @@ class Preprocessor(ast.NodeTransformer):
         self.decimal_class_alias = None
         self.decimal_module_alias = None
         self._subscript_inferred_vars = set()  # vars whose annotations came from subscript inference
+        self.generator_funcs = set()  # generator functions with early return before first yield
+        self.generator_vars = {}  # var_name → func_name for generator variables
 
     def _create_helper_functions(self):
         """Create the ESBMC helper function definitions"""
@@ -260,6 +262,27 @@ class Preprocessor(ast.NodeTransformer):
             prefix, result_expr = self.preprocessor._lower_listcomp(node)
             self.statements.extend(prefix)
             return result_expr
+
+    def _has_early_return_before_yield(self, body):
+        """Return True if body has a Return statement before any Yield (linear top-level scan)."""
+        for stmt in body:
+            if isinstance(stmt, ast.Return):
+                return True
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Yield, ast.YieldFrom)):
+                return False
+        return False
+
+    def _find_generator_next_call(self, node):
+        """Return True if node tree contains next(g) where g is a tracked generator variable."""
+        for child in ast.walk(node):
+            if (isinstance(child, ast.Call) and
+                    isinstance(child.func, ast.Name) and
+                    child.func.id == 'next' and
+                    len(child.args) == 1 and
+                    isinstance(child.args[0], ast.Name) and
+                    child.args[0].id in self.generator_vars):
+                return True
+        return False
 
     def _lower_listcomp_in_expr(self, expr):
         """Lower all list comprehensions inside an expression node."""
@@ -1798,6 +1821,21 @@ class Preprocessor(ast.NodeTransformer):
         # First visit child nodes
         node = self.generic_visit(node)
 
+        # Transform: assignment containing next(generator) where generator has early return
+        # → raise StopIteration (Python semantics: early return before yield raises StopIteration)
+        if self._find_generator_next_call(node.value):
+            raise_node = ast.Raise(
+                exc=ast.Call(
+                    func=ast.Name(id='StopIteration', ctx=ast.Load()),
+                    args=[ast.Constant(value='StopIteration')],
+                    keywords=[]
+                ),
+                cause=None
+            )
+            ast.copy_location(raise_node, node)
+            ast.fix_missing_locations(raise_node)
+            return raise_node
+
         prefix, lowered_value = self._lower_listcomp_in_expr(node.value)
         if prefix:
             if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
@@ -1831,6 +1869,9 @@ class Preprocessor(ast.NodeTransformer):
                     if (isinstance(node.value, ast.Call) and
                             isinstance(node.value.func, ast.Name)):
                         self.instance_class_map[target.id] = node.value.func.id
+                        # Track generator variables: g = gen() where gen is a generator
+                        if node.value.func.id in self.generator_funcs:
+                            self.generator_vars[target.id] = node.value.func.id
                 return node
 
         # Handle multiple assignment: convert ans = i = 0 into separate assignments
@@ -2144,6 +2185,11 @@ class Preprocessor(ast.NodeTransformer):
 
 
     def visit_FunctionDef(self, node):
+        # Detect generator functions: contain yield AND have early return before first yield
+        if any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(node)):
+            if self._has_early_return_before_yield(node.body):
+                self.generator_funcs.add(node.name)
+
         # Store return type annotation so call-expression iterables can resolve types
         if node.returns is not None:
             self.function_return_annotations[node.name] = node.returns
