@@ -29,6 +29,7 @@ class Preprocessor(ast.NodeTransformer):
         self.generator_vars = {}  # var_name → func_name for generator variables
         self.generator_func_defs = {}  # func_name → transformed body (list of stmts)
         self.generator_next_index = {}  # gen_var → next yield index for next() calls
+        self.generator_emitted_init = set()  # gen_vars whose outer_init has been emitted
 
     def _create_helper_functions(self):
         """Create the ESBMC helper function definitions"""
@@ -364,35 +365,77 @@ class Preprocessor(ast.NodeTransformer):
 
     def _collect_yields(self, stmts, in_loop=False):
         """
-        Collect yield points from a generator body in execution order.
-        Returns list of (pre_stmts, yield_val, is_repeating) where:
-          - pre_stmts: statements between the previous yield and this one
-                       (in the innermost scope containing the yield)
-          - yield_val: the yielded value expression
-          - is_repeating: True if the yield is inside a loop (same yield
-                          is hit on every next() call, index should not advance)
+        Collect yield points from a generator body.
+
+        Returns (outer_init, yields) where:
+          outer_init : top-level statements before the first yield/loop-with-yield
+                       (generator initialisation — emitted once per generator var).
+          yields     : list of (pre_stmts, yield_val, post_stmts, is_repeating)
+            pre_stmts : statements inside the innermost scope before this yield
+                        (e.g. `k = rand1[0]` inside the while body)
+            yield_val : the yielded expression
+            post_stmts: statements after this yield until the next yield
+                        (e.g. `i += 1` after `yield i`)
+            is_repeating: True when the yield is inside a loop
         """
+        outer_init = []
         yields = []
-        pre = []
-        for stmt in stmts:
+        current_pre = []
+        found_yield = False
+        i = 0
+        while i < len(stmts):
+            stmt = stmts[i]
             if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Yield):
-                yields.append((pre[:], stmt.value.value, in_loop))
-                pre = []
+                # collect post: stmts after yield until next yield in same scope
+                post = []
+                j = i + 1
+                while j < len(stmts):
+                    if isinstance(stmts[j], ast.Expr) and isinstance(stmts[j].value, ast.Yield):
+                        break
+                    post.append(stmts[j])
+                    j += 1
+                yields.append((current_pre[:], stmt.value.value, post, in_loop))
+                current_pre = []
+                found_yield = True
+                i = j
             elif isinstance(stmt, (ast.While, ast.For)):
-                inner = self._collect_yields(stmt.body, in_loop=True)
-                if inner:
-                    yields.extend(inner)
+                loop_init, loop_yields = self._collect_yields(stmt.body, in_loop=True)
+                if loop_yields:
+                    # Merge loop_init (stmts before yield inside loop) into first yield's pre
+                    combined = loop_init + loop_yields[0][0]
+                    ip, iv, ipo, ir = loop_yields[0]
+                    loop_yields[0] = (combined, iv, ipo, ir)
+                    yields.extend(loop_yields)
+                    current_pre = []
+                    found_yield = True
                 else:
-                    pre.append(stmt)
+                    if not found_yield:
+                        outer_init.append(stmt)
+                    else:
+                        current_pre.append(stmt)
+                i += 1
             elif isinstance(stmt, ast.If):
-                inner = self._collect_yields(stmt.body, in_loop=in_loop)
-                if inner:
-                    yields.extend(inner)
+                if_init, if_yields = self._collect_yields(stmt.body, in_loop=in_loop)
+                if if_yields:
+                    combined = if_init + if_yields[0][0]
+                    ip, iv, ipo, ir = if_yields[0]
+                    if_yields[0] = (combined, iv, ipo, ir)
+                    yields.extend(if_yields)
+                    current_pre = []
+                    found_yield = True
                 else:
-                    pre.append(stmt)
+                    if not found_yield:
+                        outer_init.append(stmt)
+                    else:
+                        current_pre.append(stmt)
+                i += 1
             else:
-                pre.append(stmt)
-        return yields
+                if not found_yield:
+                    outer_init.append(stmt)
+                else:
+                    current_pre.append(stmt)
+                i += 1
+        return outer_init, yields
 
     def _make_stop_iteration_raise(self, template_node):
         """Build `raise StopIteration('StopIteration')` AST node."""
@@ -412,38 +455,36 @@ class Preprocessor(ast.NodeTransformer):
         """
         Inline `x = next(g)` for a normal generator.
 
-        Tracks `generator_next_index[gen_var]` to advance through successive
-        yields for generators with multiple linear yields (e.g. yield 1; yield 2).
-        For yields inside loops (is_repeating=True) the index is not advanced,
-        so the same yielded expression is used on every call — correct when the
-        caller's while loop drives the iteration count.
-
-        When the generator is exhausted (index past all yields) emits
-        `raise StopIteration` instead.  Pass targets=None for a standalone
-        `next(g)` call where the returned value is discarded.
-
+        Emits outer_init (generator initialisation) on the first call for
+        gen_var, then per-call: pre_stmts + assignment + post_stmts.
+        For yields inside loops (is_repeating=True) the index is not advanced.
+        Pass targets=None for a standalone next(g) with no assignment target.
         Returns list of statements, or None if inlining is not possible.
         """
         import copy
         body_stmts = self.generator_func_defs.get(func_name)
         if body_stmts is None:
             return None
-        yields = self._collect_yields(body_stmts)
+        outer_init, yields = self._collect_yields(body_stmts)
         if not yields:
             return None
 
         idx = self.generator_next_index.get(gen_var, 0)
-        # Generator exhausted: raise StopIteration
         if idx >= len(yields):
             return [self._make_stop_iteration_raise(template_node)]
 
-        pre_stmts, yield_val, is_repeating = yields[idx]
+        pre_stmts, yield_val, post_stmts, is_repeating = yields[idx]
 
-        # Advance only for non-repeating (linear) yields
         if not is_repeating:
             self.generator_next_index[gen_var] = idx + 1
 
-        result = [copy.deepcopy(s) for s in pre_stmts]
+        result = []
+        # Emit init code once per generator variable
+        if outer_init and gen_var not in self.generator_emitted_init:
+            result.extend([copy.deepcopy(s) for s in outer_init])
+            self.generator_emitted_init.add(gen_var)
+
+        result.extend([copy.deepcopy(s) for s in pre_stmts])
         if targets is not None:
             assign = ast.Assign(
                 targets=targets,
@@ -453,6 +494,7 @@ class Preprocessor(ast.NodeTransformer):
             ast.copy_location(assign, template_node)
             ast.fix_missing_locations(assign)
             result.append(assign)
+        result.extend([copy.deepcopy(s) for s in post_stmts])
         for stmt in result:
             self.ensure_all_locations(stmt, template_node)
             ast.fix_missing_locations(stmt)
