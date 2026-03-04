@@ -24,7 +24,8 @@ class Preprocessor(ast.NodeTransformer):
         self.decimal_class_alias = None
         self.decimal_module_alias = None
         self._subscript_inferred_vars = set()  # vars whose annotations came from subscript inference
-        self.generator_funcs = set()  # generator functions (contain yield)
+        self.generator_funcs = set()  # all generator functions (contain yield)
+        self.early_return_generator_funcs = set()  # generators with early return before first yield
         self.generator_vars = {}  # var_name → func_name for generator variables
         self.generator_func_defs = {}  # func_name → transformed body (list of stmts)
 
@@ -347,16 +348,62 @@ class Preprocessor(ast.NodeTransformer):
         return result
 
     def _find_generator_next_call(self, node):
-        """Return True if node tree contains next(g) where g is a tracked generator variable."""
+        """Return (gen_var, func_name) if node contains next(g) for a tracked generator, else None."""
         for child in ast.walk(node):
             if (isinstance(child, ast.Call) and
                     isinstance(child.func, ast.Name) and
                     child.func.id == 'next' and
                     len(child.args) == 1 and
-                    isinstance(child.args[0], ast.Name) and
-                    child.args[0].id in self.generator_vars):
-                return True
-        return False
+                    isinstance(child.args[0], ast.Name)):
+                gen_var = child.args[0].id
+                func_name = self.generator_vars.get(gen_var)
+                if func_name is not None:
+                    return (gen_var, func_name)
+        return None
+
+    def _find_first_yield_path(self, stmts):
+        """
+        Find the code path to the first yield in a statement list.
+        Returns (pre_stmts, yield_val): statements immediately before the yield
+        in the innermost containing scope, and the yielded value expression.
+        Returns (stmts, None) if no yield is found.
+        """
+        for i, stmt in enumerate(stmts):
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Yield):
+                return stmts[:i], stmt.value.value
+            if isinstance(stmt, (ast.While, ast.For, ast.If)):
+                pre, val = self._find_first_yield_path(stmt.body)
+                if val is not None:
+                    return pre, val
+        return stmts, None
+
+    def _inline_next_call(self, targets, func_name, template_node):
+        """
+        Inline `x = next(g)` for a normal generator as: [pre_stmts; x = yield_val].
+        pre_stmts are the statements that execute before the first yield (in the
+        innermost scope — e.g. inside the generator's while body, not the init code).
+        Returns list of statements, or None if inlining is not possible.
+        """
+        import copy
+        body_stmts = self.generator_func_defs.get(func_name)
+        if body_stmts is None:
+            return None
+        pre_stmts, yield_val = self._find_first_yield_path(body_stmts)
+        if yield_val is None:
+            return None
+        result = [copy.deepcopy(s) for s in pre_stmts]
+        assign = ast.Assign(
+            targets=targets,
+            value=copy.deepcopy(yield_val),
+            type_comment=None
+        )
+        ast.copy_location(assign, template_node)
+        ast.fix_missing_locations(assign)
+        result.append(assign)
+        for stmt in result:
+            self.ensure_all_locations(stmt, template_node)
+            ast.fix_missing_locations(stmt)
+        return result
 
     def _lower_listcomp_in_expr(self, expr):
         """Lower all list comprehensions inside an expression node."""
@@ -1900,20 +1947,28 @@ class Preprocessor(ast.NodeTransformer):
         # First visit child nodes
         node = self.generic_visit(node)
 
-        # Transform: assignment containing next(generator) where generator has early return
-        # → raise StopIteration (Python semantics: early return before yield raises StopIteration)
-        if self._find_generator_next_call(node.value):
-            raise_node = ast.Raise(
-                exc=ast.Call(
-                    func=ast.Name(id='StopIteration', ctx=ast.Load()),
-                    args=[ast.Constant(value='StopIteration')],
-                    keywords=[]
-                ),
-                cause=None
-            )
-            ast.copy_location(raise_node, node)
-            ast.fix_missing_locations(raise_node)
-            return raise_node
+        # Handle x = next(g) for generator variables
+        next_gen_info = self._find_generator_next_call(node.value)
+        if next_gen_info is not None:
+            gen_var, func_name = next_gen_info
+            if func_name in self.early_return_generator_funcs:
+                # Early return before first yield: next() raises StopIteration immediately
+                raise_node = ast.Raise(
+                    exc=ast.Call(
+                        func=ast.Name(id='StopIteration', ctx=ast.Load()),
+                        args=[ast.Constant(value='StopIteration')],
+                        keywords=[]
+                    ),
+                    cause=None
+                )
+                ast.copy_location(raise_node, node)
+                ast.fix_missing_locations(raise_node)
+                return raise_node
+            else:
+                # Normal generator: inline code path to first yield → x = yielded_val
+                stmts = self._inline_next_call(node.targets, func_name, node)
+                if stmts is not None:
+                    return stmts
 
         prefix, lowered_value = self._lower_listcomp_in_expr(node.value)
         if prefix:
@@ -2273,8 +2328,8 @@ class Preprocessor(ast.NodeTransformer):
         is_generator = any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(node))
         if is_generator:
             self.generator_funcs.add(node.name)
-            # For early-return-before-yield: handled by next(g) → raise StopIteration
-            # For normal generators: body is saved after transformation for inlining
+            if self._has_early_return_before_yield(node.body):
+                self.early_return_generator_funcs.add(node.name)
 
         # Store return type annotation so call-expression iterables can resolve types
         if node.returns is not None:
