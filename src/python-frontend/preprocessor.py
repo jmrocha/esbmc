@@ -28,6 +28,7 @@ class Preprocessor(ast.NodeTransformer):
         self.early_return_generator_funcs = set()  # generators with early return before first yield
         self.generator_vars = {}  # var_name → func_name for generator variables
         self.generator_func_defs = {}  # func_name → transformed body (list of stmts)
+        self.generator_next_index = {}  # gen_var → next yield index for next() calls
 
     def _create_helper_functions(self):
         """Create the ESBMC helper function definitions"""
@@ -361,36 +362,68 @@ class Preprocessor(ast.NodeTransformer):
                     return (gen_var, func_name)
         return None
 
-    def _find_first_yield_path(self, stmts):
+    def _collect_yields(self, stmts, in_loop=False):
         """
-        Find the code path to the first yield in a statement list.
-        Returns (pre_stmts, yield_val): statements immediately before the yield
-        in the innermost containing scope, and the yielded value expression.
-        Returns (stmts, None) if no yield is found.
+        Collect yield points from a generator body in execution order.
+        Returns list of (pre_stmts, yield_val, is_repeating) where:
+          - pre_stmts: statements between the previous yield and this one
+                       (in the innermost scope containing the yield)
+          - yield_val: the yielded value expression
+          - is_repeating: True if the yield is inside a loop (same yield
+                          is hit on every next() call, index should not advance)
         """
-        for i, stmt in enumerate(stmts):
+        yields = []
+        pre = []
+        for stmt in stmts:
             if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Yield):
-                return stmts[:i], stmt.value.value
-            if isinstance(stmt, (ast.While, ast.For, ast.If)):
-                pre, val = self._find_first_yield_path(stmt.body)
-                if val is not None:
-                    return pre, val
-        return stmts, None
+                yields.append((pre[:], stmt.value.value, in_loop))
+                pre = []
+            elif isinstance(stmt, (ast.While, ast.For)):
+                inner = self._collect_yields(stmt.body, in_loop=True)
+                if inner:
+                    yields.extend(inner)
+                else:
+                    pre.append(stmt)
+            elif isinstance(stmt, ast.If):
+                inner = self._collect_yields(stmt.body, in_loop=in_loop)
+                if inner:
+                    yields.extend(inner)
+                else:
+                    pre.append(stmt)
+            else:
+                pre.append(stmt)
+        return yields
 
-    def _inline_next_call(self, targets, func_name, template_node):
+    def _inline_next_call(self, targets, func_name, gen_var, template_node):
         """
-        Inline `x = next(g)` for a normal generator as: [pre_stmts; x = yield_val].
-        pre_stmts are the statements that execute before the first yield (in the
-        innermost scope — e.g. inside the generator's while body, not the init code).
+        Inline `x = next(g)` for a normal generator.
+
+        Tracks `generator_next_index[gen_var]` to advance through successive
+        yields for generators with multiple linear yields (e.g. yield 1; yield 2).
+        For yields inside loops (is_repeating=True) the index is not advanced,
+        so the same yielded expression is used on every call — correct when the
+        caller's while loop drives the iteration count.
+
         Returns list of statements, or None if inlining is not possible.
         """
         import copy
         body_stmts = self.generator_func_defs.get(func_name)
         if body_stmts is None:
             return None
-        pre_stmts, yield_val = self._find_first_yield_path(body_stmts)
-        if yield_val is None:
+        yields = self._collect_yields(body_stmts)
+        if not yields:
             return None
+
+        idx = self.generator_next_index.get(gen_var, 0)
+        # Clamp to last yield (exhausted generator is not modelled here)
+        if idx >= len(yields):
+            idx = len(yields) - 1
+        pre_stmts, yield_val, is_repeating = yields[idx]
+
+        # Advance only for non-repeating (linear) yields
+        if not is_repeating:
+            self.generator_next_index[gen_var] = idx + 1
+
         result = [copy.deepcopy(s) for s in pre_stmts]
         assign = ast.Assign(
             targets=targets,
@@ -1966,7 +1999,7 @@ class Preprocessor(ast.NodeTransformer):
                 return raise_node
             else:
                 # Normal generator: inline code path to first yield → x = yielded_val
-                stmts = self._inline_next_call(node.targets, func_name, node)
+                stmts = self._inline_next_call(node.targets, func_name, gen_var, node)
                 if stmts is not None:
                     return stmts
 
