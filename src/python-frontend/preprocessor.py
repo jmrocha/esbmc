@@ -394,6 +394,20 @@ class Preprocessor(ast.NodeTransformer):
                 pre.append(stmt)
         return yields
 
+    def _make_stop_iteration_raise(self, template_node):
+        """Build `raise StopIteration('StopIteration')` AST node."""
+        raise_node = ast.Raise(
+            exc=ast.Call(
+                func=ast.Name(id='StopIteration', ctx=ast.Load()),
+                args=[ast.Constant(value='StopIteration')],
+                keywords=[]
+            ),
+            cause=None
+        )
+        ast.copy_location(raise_node, template_node)
+        ast.fix_missing_locations(raise_node)
+        return raise_node
+
     def _inline_next_call(self, targets, func_name, gen_var, template_node):
         """
         Inline `x = next(g)` for a normal generator.
@@ -403,6 +417,10 @@ class Preprocessor(ast.NodeTransformer):
         For yields inside loops (is_repeating=True) the index is not advanced,
         so the same yielded expression is used on every call — correct when the
         caller's while loop drives the iteration count.
+
+        When the generator is exhausted (index past all yields) emits
+        `raise StopIteration` instead.  Pass targets=None for a standalone
+        `next(g)` call where the returned value is discarded.
 
         Returns list of statements, or None if inlining is not possible.
         """
@@ -415,9 +433,10 @@ class Preprocessor(ast.NodeTransformer):
             return None
 
         idx = self.generator_next_index.get(gen_var, 0)
-        # Clamp to last yield (exhausted generator is not modelled here)
+        # Generator exhausted: raise StopIteration
         if idx >= len(yields):
-            idx = len(yields) - 1
+            return [self._make_stop_iteration_raise(template_node)]
+
         pre_stmts, yield_val, is_repeating = yields[idx]
 
         # Advance only for non-repeating (linear) yields
@@ -425,14 +444,15 @@ class Preprocessor(ast.NodeTransformer):
             self.generator_next_index[gen_var] = idx + 1
 
         result = [copy.deepcopy(s) for s in pre_stmts]
-        assign = ast.Assign(
-            targets=targets,
-            value=copy.deepcopy(yield_val),
-            type_comment=None
-        )
-        ast.copy_location(assign, template_node)
-        ast.fix_missing_locations(assign)
-        result.append(assign)
+        if targets is not None:
+            assign = ast.Assign(
+                targets=targets,
+                value=copy.deepcopy(yield_val),
+                type_comment=None
+            )
+            ast.copy_location(assign, template_node)
+            ast.fix_missing_locations(assign)
+            result.append(assign)
         for stmt in result:
             self.ensure_all_locations(stmt, template_node)
             ast.fix_missing_locations(stmt)
@@ -456,6 +476,18 @@ class Preprocessor(ast.NodeTransformer):
 
     def visit_Expr(self, node):
         node = self.generic_visit(node)
+
+        # Handle standalone next(g) — same logic as visit_Assign but no target
+        next_gen_info = self._find_generator_next_call(node.value)
+        if next_gen_info is not None:
+            gen_var, func_name = next_gen_info
+            if func_name in self.early_return_generator_funcs:
+                return self._make_stop_iteration_raise(node)
+            else:
+                stmts = self._inline_next_call(None, func_name, gen_var, node)
+                if stmts is not None:
+                    return stmts
+
         prefix, new_value = self._lower_listcomp_in_expr(node.value)
         node.value = new_value
         if prefix:
